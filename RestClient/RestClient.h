@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <Event.h>
 
 #include "CurlWrapper.h"
@@ -35,6 +36,19 @@ public:
         }
         return m_Status == ResponseStatus::Completed;
     }
+};
+
+class StreamingRestClient : public RestClient {
+public:
+    typedef std::function<void(const char* bytes, size_t count)> ChunkCallback;
+    StreamingRestClient(ChunkCallback callback) : m_callback(callback) {}
+protected:
+    void OnContent(const char* bytes, size_t count) override {
+        if (m_callback) m_callback(bytes, count);
+        RestClient::OnContent(bytes, count);
+    }
+private:
+    ChunkCallback m_callback;
 };
 
 class AsyncRestClient : public RestClient {

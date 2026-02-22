@@ -19,6 +19,8 @@
 #include <Defines.h>
 #include <ImGuiAddons.h> // Add this include
 #include <algorithm>
+#include <functional>
+#include <ranges>
 #include <RestClient.h>
 #include <sstream>
 #include <thread>
@@ -56,9 +58,10 @@ namespace {
     bool play_speech_from_vendors = true;
     bool play_tts_in_explorable_areas = true;
     bool play_tts_in_outposts = true;
+    int tts_timeout = 2;
 
     struct PendingNPCAudio;
-    typedef std::string (*GenerateVoiceCallback)(PendingNPCAudio* audio);
+    typedef void (*GenerateVoiceCallback)(PendingNPCAudio* audio);
 
     struct DialogueFrameContext {
         GW::UI::UICtlCallback* vtable;
@@ -114,12 +117,12 @@ namespace {
     std::map<GWRace, bool> play_speech_from_race;
 
         // Add OpenAI TTS function
-    std::string GenerateVoiceOpenAI(PendingNPCAudio*);
-    std::string GenerateVoiceElevenLabs(PendingNPCAudio*);
-    std::string GenerateVoiceGoogle(PendingNPCAudio*);
-    std::string GenerateVoicePlayHT(PendingNPCAudio* );
-    std::string GenerateVoiceGWDevHub(PendingNPCAudio*);
-    std::string GenerateVoiceKokoro(PendingNPCAudio*);
+    void GenerateVoiceOpenAI(PendingNPCAudio*);
+    void GenerateVoiceElevenLabs(PendingNPCAudio*);
+    void GenerateVoiceGoogle(PendingNPCAudio*);
+    void GenerateVoicePlayHT(PendingNPCAudio* );
+    void GenerateVoiceGWDevHub(PendingNPCAudio*);
+    void GenerateVoiceKokoro(PendingNPCAudio*);
 
     // Static API configurations
     APIConfig api_configs[] = {
@@ -522,6 +525,7 @@ namespace {
         uint32_t agent_id = 0;
         uint32_t model_file_id = 0;
         std::filesystem::path path;
+        std::vector<std::filesystem::path> playback_queue;
         clock_t started = 0;
         clock_t duration = 0;
         bool is_dialog_window = false;
@@ -530,7 +534,7 @@ namespace {
             // NB: Duration of 0 implies the file is being generated, so for the purpose of this check, we assume it is about to play
             return duration == 0 || TIMER_DIFF(started) < duration;
         }
-        void Play();
+        void Play(const std::filesystem::path& chunk_path = "");
         void Stop();
         PendingNPCAudio(uint32_t _agent_id, const wchar_t* message, bool _is_dialog_window = false);
         ~PendingNPCAudio();
@@ -579,38 +583,45 @@ namespace {
             delete pending_audio[0];
         }
     }
-    void PendingNPCAudio::Play()
+    void PendingNPCAudio::Play(const std::filesystem::path& chunk_path)
     {
         std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
+        if (!chunk_path.empty()) {
+            playback_queue.push_back(chunk_path);
+        }
+        if (IsPlaying() && !chunk_path.empty()) return; // Already playing, and we just queued this chunk
+
         const auto found = playing_audio_map.find(agent_id);
-        if (found != playing_audio_map.end()) {
-            if (found->second->path == this->path && found->second->IsPlaying()) {
-                delete this; // Don't play the same audio
-                return;
-            }
-            if (found->second != this) delete found->second;
+        if (found != playing_audio_map.end() && found->second != this) {
+            delete found->second;
         }
 
-        // Don't play more than one dialog track at once
-        Stop();
-        if (!duration)
-            duration = EstimateAudioDuration(path);
+        if (playback_queue.empty()) return;
+        
+        path = playback_queue.front();
+        playback_queue.erase(playback_queue.begin());
+
+        duration = EstimateAudioDuration(path);
 
         // Play the new audio
         const auto pos = GetAgentVec3f(agent_id);
-        VoiceLog("Playing audio file: %s (estimated duration: %dms)", path.filename().string().c_str(), duration);
+        VoiceLog("Playing audio chunk: %s (estimated duration: %dms)", path.filename().string().c_str(), duration);
         // 0x1400 means "this audio file in positional", so it will play in 3D space relative to the position given
         // 0x4 means "this is a dialog audio file"
         uint32_t flags = 0x4;
         if (!is_dialog_window) flags |= 0x1400;
         if (!AudioSettings::PlaySound(path.wstring().c_str(), &pos, flags, &gw_handle)) {
-            delete this; // Too naughty?
+            if (!playback_queue.empty()) Play(); // Try next chunk
+            else delete this;
             return;
         }
 
         // Add to playing audio map
         started = TIMER_INIT();
-        pending_audio.erase(std::remove(pending_audio.begin(), pending_audio.end(), this), pending_audio.end());
+        const auto found_pending = std::find(pending_audio.begin(), pending_audio.end(), this);
+        if (found_pending != pending_audio.end()) {
+            pending_audio.erase(found_pending);
+        }
         playing_audio_map[agent_id] = this;
         
     }
@@ -621,6 +632,17 @@ namespace {
     PendingNPCAudio::~PendingNPCAudio()
     {
         Stop();
+        
+        // Clean up streaming chunks (both queued and currently playing)
+        std::error_code ec;
+        if (!path.empty() && path.parent_path().filename() == "streaming") {
+            std::filesystem::remove(path, ec);
+        }
+        for (const auto& chunk : playback_queue) {
+            std::filesystem::remove(chunk, ec);
+        }
+        playback_queue.clear();
+        
         std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
         const auto found = playing_audio_map.find(agent_id);
         if (found != playing_audio_map.end()) {
@@ -1122,7 +1144,7 @@ namespace {
         client.SetFollowLocation(true);
         client.SetVerifyHost(false);
         client.SetVerifyPeer(false);
-        client.SetTimeoutSec(2);
+        client.SetTimeoutSec(tts_timeout);
 
         client.Execute();
 
@@ -1134,19 +1156,108 @@ namespace {
             }
             return "";
         }
-
+        
         return std::move(client.GetContent());
     }
 
+    // Shared function for making streaming JSON API requests
+    void StreamingPostJson(PendingNPCAudio* audio, const std::string& url, const nlohmann::json& request_body, const std::string& service_name = "API")
+    {
+        std::string current_chunk_data;
+        size_t chunk_count = 0;
+
+        auto on_chunk = [&](const char* bytes, size_t count) {
+            // Check if audio object is still valid
+            {
+                std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
+                if (std::ranges::find(pending_audio, audio) == pending_audio.end() &&
+                    playing_audio_map.find(audio->agent_id) == playing_audio_map.end()) {
+                    return; // Audio was deleted, stop processing
+                }
+            }
+            
+            current_chunk_data.append(bytes, count);
+            
+            // Look for MP3 frame sync / ID3 tag which Kokoro sends between sentences
+            // Kokoro-FastAPI yields a complete MP3 file per sentence.
+            // We search for the start of a new MP3 stream (ID3 or 0xFF 0xFB sync)
+            const unsigned char mp3_sync[] = { 0xFF, 0xFB };
+            const char id3_sync[] = "ID3";
+            
+            size_t search_offset = 10; // Skip the header of the current chunk we are building
+            while (current_chunk_data.size() > search_offset) {
+                size_t next_sync = current_chunk_data.find(id3_sync, search_offset);
+                if (next_sync == std::string::npos) {
+                    next_sync = current_chunk_data.find(reinterpret_cast<const char*>(mp3_sync), search_offset, sizeof(mp3_sync));
+                }
+
+                if (next_sync != std::string::npos) {
+                    // We found the start of the NEXT sentence. 
+                    // Extract the COMPLETED sentence before it.
+                    std::string finished_sentence = current_chunk_data.substr(0, next_sync);
+                    current_chunk_data = current_chunk_data.substr(next_sync);
+
+                    // Save this sentence to a temp file and play it
+                    auto chunk_path = Resources::GetPath("NPCVoiceCache") / "streaming" / std::format("{}_{}_{}.mp3", audio->agent_id, TIMER_INIT(), chunk_count++);
+                    Resources::EnsureFolderExists(chunk_path.parent_path());
+                    
+                    FILE* fp = fopen(chunk_path.string().c_str(), "wb");
+                    if (fp) {
+                        fwrite(finished_sentence.data(), 1, finished_sentence.size(), fp);
+                        fclose(fp);
+                        audio->Play(chunk_path);
+                    }
+                    search_offset = 10;
+                } else {
+                    break; 
+                }
+            }
+        };
+
+        StreamingRestClient client(on_chunk);
+        client.SetUrl(url.c_str());
+        client.SetHeader("Content-Type", "application/json");
+        client.SetPostContent(request_body.dump(), ContentFlag::Copy);
+        client.SetFollowLocation(true);
+        client.SetVerifyHost(false);
+        client.SetVerifyPeer(false);
+        client.SetTimeoutSec(tts_timeout);
+
+        client.Execute();
+
+        // Don't forget the very last chunk
+        if (!current_chunk_data.empty() && client.IsSuccessful()) {
+            // Check if audio object is still valid before processing final chunk
+            {
+                std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
+                if (std::ranges::find(pending_audio, audio) == pending_audio.end() &&
+                    playing_audio_map.find(audio->agent_id) == playing_audio_map.end()) {
+                    return; // Audio was deleted, stop processing
+                }
+            }
+            
+            auto chunk_path = Resources::GetPath("NPCVoiceCache") / "streaming" / std::format("{}_{}_{}.mp3", audio->agent_id, TIMER_INIT(), chunk_count++);
+            Resources::EnsureFolderExists(chunk_path.parent_path());
+            FILE* fp = fopen(chunk_path.string().c_str(), "wb");
+            if (fp) {
+                fwrite(current_chunk_data.data(), 1, current_chunk_data.size(), fp);
+                fclose(fp);
+                audio->Play(chunk_path);
+            }
+        }
+    }
+
     // Add OpenAI TTS function
-    std::string GenerateVoiceOpenAI(PendingNPCAudio* audio)
+    void GenerateVoiceOpenAI(PendingNPCAudio* audio)
     {
         if (!(audio && audio->profile)) {
-            return VoiceLog("No Audio Profile"), "";
+            VoiceLog("No Audio Profile");
+            return;
         }
         const auto api_config = GetCurrentAPIConfig();
         if (!(api_config && *api_config->api_key)) {
-            return VoiceLog("No API Key"), "";
+            VoiceLog("No API Key");
+            return;
         }
 
 
@@ -1166,18 +1277,27 @@ namespace {
         const auto audio_data = PostJson(client, "https://api.openai.com/v1/audio/speech", request_body, api_config->name);
         if (!audio_data.empty()) {
             VoiceLog("OpenAI voice generation successful, received %zu bytes", audio_data.size());
+            auto temp_path = Resources::GetPath("NPCVoiceCache") / LanguageToAbbreviation(audio->language) / GenerateOptimizedCacheKey(audio);
+            Resources::EnsureFolderExists(temp_path.parent_path());
+            FILE* fp = fopen(temp_path.string().c_str(), "wb");
+            if (fp) {
+                fwrite(audio_data.data(), 1, audio_data.size(), fp);
+                fclose(fp);
+                audio->Play(temp_path);
+            }
         }
-        return audio_data;
     }
     // Refactored ElevenLabs voice generation
-    std::string GenerateVoiceElevenLabs(PendingNPCAudio* audio)
+    void GenerateVoiceElevenLabs(PendingNPCAudio* audio)
     {
         if (!(audio && audio->profile)) {
-            return VoiceLog("No Audio Profile"), "";
+            VoiceLog("No Audio Profile");
+            return;
         }
         const auto api_config = GetCurrentAPIConfig();
         if (!(api_config && *api_config->api_key)) {
-            return VoiceLog("No API Key"), "";
+            VoiceLog("No API Key");
+            return;
         }
 
         nlohmann::json request_body;
@@ -1199,11 +1319,18 @@ namespace {
         const auto audio_data = PostJson(client, "https://api.elevenlabs.io/v1/text-to-speech/" + audio->profile->voice_id, request_body, api_config->name);
         if (!audio_data.empty()) {
             VoiceLog("ElevenLabs voice generation successful, received %zu bytes", audio_data.size());
+            auto temp_path = Resources::GetPath("NPCVoiceCache") / LanguageToAbbreviation(audio->language) / GenerateOptimizedCacheKey(audio);
+            Resources::EnsureFolderExists(temp_path.parent_path());
+            FILE* fp = fopen(temp_path.string().c_str(), "wb");
+            if (fp) {
+                fwrite(audio_data.data(), 1, audio_data.size(), fp);
+                fclose(fp);
+                audio->Play(temp_path);
+            }
         }
-        return audio_data;
     }
 
-    std::string GenerateVoiceGWDevHub(PendingNPCAudio* audio)
+    void GenerateVoiceGWDevHub(PendingNPCAudio* audio)
     {
         // Build JSON request body
         nlohmann::json request_body = nlohmann::json::object();
@@ -1240,18 +1367,27 @@ namespace {
 
         if (!audio_data.empty()) {
             VoiceLog("GWDevHub voice generation successful, received %zu bytes", audio_data.size());
+            auto temp_path = Resources::GetPath("NPCVoiceCache") / LanguageToAbbreviation(audio->language) / GenerateOptimizedCacheKey(audio);
+            Resources::EnsureFolderExists(temp_path.parent_path());
+            FILE* fp = fopen(temp_path.string().c_str(), "wb");
+            if (fp) {
+                fwrite(audio_data.data(), 1, audio_data.size(), fp);
+                fclose(fp);
+                audio->Play(temp_path);
+            }
         }
-        return audio_data;
     }
 
-    std::string GenerateVoiceKokoro(PendingNPCAudio* audio)
+    void GenerateVoiceKokoro(PendingNPCAudio* audio)
     {
         if (!(audio && audio->profile)) {
-            return VoiceLog("No Audio Profile"), "";
+            VoiceLog("No Audio Profile");
+            return;
         }
         const auto api_config = GetCurrentAPIConfig();
         if (!api_config) {
-            return VoiceLog("No API config"), "";
+            VoiceLog("No API config");
+            return;
         }
 
         // Uses the api_key field for the URL since none of the others have a customizable url
@@ -1269,6 +1405,7 @@ namespace {
         request_body["voice"] = voice_name;
         request_body["response_format"] = "mp3";
         request_body["speed"] = audio->profile->speaking_rate;
+        request_body["stream"] = true;
 
         // Kokoro uses single-letter language codes:
         // a=American English, b=British English, e=Spanish, f=French, i=Italian, j=Japanese, z=Mandarin Chinese
@@ -1284,22 +1421,19 @@ namespace {
         }
         request_body["lang_code"] = lang_code;
 
-        RestClient client;
-        const auto audio_data = PostJson(client, base_url + "/v1/audio/speech", request_body, api_config->name);
-        if (!audio_data.empty()) {
-            VoiceLog("Kokoro voice generation successful, received %zu bytes", audio_data.size());
-        }
-        return audio_data;
+        StreamingPostJson(audio, base_url + "/v1/audio/speech", request_body, api_config->name);
     }
 
-    std::string GenerateVoiceGoogle(PendingNPCAudio* audio)
+    void GenerateVoiceGoogle(PendingNPCAudio* audio)
     {
         if (!(audio && audio->profile)) {
-            return VoiceLog("No Audio Profile"), "";
+            VoiceLog("No Audio Profile");
+            return;
         }
         const auto api_config = GetCurrentAPIConfig();
         if (!(api_config && *api_config->api_key)) {
-            return VoiceLog("No API Key"), "";
+            VoiceLog("No API Key");
+            return;
         }
 
         // Build request body using safe JSON construction
@@ -1328,37 +1462,48 @@ namespace {
         RestClient client;
         const auto response_str = PostJson(client, "https://texttospeech.googleapis.com/v1/text:synthesize?key=" + std::string(api_config->api_key), request_body, api_config->name);
         if (response_str.empty())
-            return response_str;
+            return;
 
         const auto json_response = nlohmann::json::parse(response_str, nullptr, false);
         if (!(!json_response.is_discarded() && json_response.contains("audioContent") && json_response["audioContent"].is_string())) {
             VoiceLog("Failed to parse Google TTS response JSON");
-            return "";
+            return;
         }
 
         std::string base64_audio = json_response["audioContent"].get<std::string>();
         if (base64_audio.empty()) {
             VoiceLog("Google TTS returned empty audio content");
-            return "";
+            return;
         }
 
         // Decode base64 to binary audio data
         std::string audio_data = TextUtils::Base64Decode(base64_audio);
         VoiceLog("Google voice generation successful, decoded %zu bytes", audio_data.size());
-        return audio_data;
+        
+        auto temp_path = Resources::GetPath("NPCVoiceCache") / LanguageToAbbreviation(audio->language) / GenerateOptimizedCacheKey(audio);
+        Resources::EnsureFolderExists(temp_path.parent_path());
+        FILE* fp = fopen(temp_path.string().c_str(), "wb");
+        if (fp) {
+            fwrite(audio_data.data(), 1, audio_data.size(), fp);
+            fclose(fp);
+            audio->Play(temp_path);
+        }
     }
 
-    std::string GenerateVoicePlayHT(PendingNPCAudio* audio)
+    void GenerateVoicePlayHT(PendingNPCAudio* audio)
     {
         if (!(audio && audio->profile)) {
-            return VoiceLog("No Audio Profile"), "";
+            VoiceLog("No Audio Profile");
+            return;
         }
         const auto api_config = GetCurrentAPIConfig();
         if (!(api_config && *api_config->api_key)) {
-            return VoiceLog("No API Key"), "";
+            VoiceLog("No API Key");
+            return;
         }
         if (!*api_config->user_id) {
-            return VoiceLog("No User ID"), "";
+            VoiceLog("No User ID");
+            return;
         }
 
         // Build request body
@@ -1380,30 +1525,36 @@ namespace {
             voice_id = playht_voice_male_default;
         }
 
-request_body["voice"] = voice_id;
+        request_body["voice"] = voice_id;
 
-// Add language if supported (Play.ht auto-detects but we can specify)
-std::string lang_code = LanguageToAbbreviation(audio->language);
-if (lang_code == "en") {
-    request_body["voice_engine"] = "PlayHT2.0-turbo";
-}
-else {
-    request_body["voice_engine"] = "PlayHT2.0"; // Better for non-English
-}
+        // Add language if supported (Play.ht auto-detects but we can specify)
+        std::string lang_code = LanguageToAbbreviation(audio->language);
+        if (lang_code == "en") {
+            request_body["voice_engine"] = "PlayHT2.0-turbo";
+        }
+        else {
+            request_body["voice_engine"] = "PlayHT2.0"; // Better for non-English
+        }
 
-// Make API request using shared function
-RestClient client;
-client.SetHeader("Authorization", ("Bearer " + std::string(api_config->api_key)).c_str());
-client.SetHeader("X-User-ID", api_config->user_id);
-client.SetHeader("Accept", "audio/mpeg");
+        // Make API request using shared function
+        RestClient client;
+        client.SetHeader("Authorization", ("Bearer " + std::string(api_config->api_key)).c_str());
+        client.SetHeader("X-User-ID", api_config->user_id);
+        client.SetHeader("Accept", "audio/mpeg");
 
-std::string audio_data = PostJson(client, "https://api.play.ht/api/v2/tts", request_body, api_config->name);
+        std::string audio_data = PostJson(client, "https://api.play.ht/api/v2/tts", request_body, api_config->name);
 
-if (!audio_data.empty()) {
-    VoiceLog("Play.ht voice generation successful, received %zu bytes", audio_data.size());
-}
-
-return audio_data;
+        if (!audio_data.empty()) {
+            VoiceLog("Play.ht voice generation successful, received %zu bytes", audio_data.size());
+            auto temp_path = Resources::GetPath("NPCVoiceCache") / LanguageToAbbreviation(audio->language) / GenerateOptimizedCacheKey(audio);
+            Resources::EnsureFolderExists(temp_path.parent_path());
+            FILE* fp = fopen(temp_path.string().c_str(), "wb");
+            if (fp) {
+                fwrite(audio_data.data(), 1, audio_data.size(), fp);
+                fclose(fp);
+                audio->Play(temp_path);
+            }
+        }
     }
 
 
@@ -1464,44 +1615,12 @@ return audio_data;
 
             // Check cache first
             if (std::filesystem::exists(audio->path)) {
-                audio->Play();
+                audio->Play(audio->path);
                 return generating_voice = false;
             }
 
-            std::string audio_data = "";
+            if (api_config) api_config->callback(audio);
             
-            audio_data = api_config ? api_config->callback(audio) : "";
-            {
-                std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
-                if (std::ranges::find(pending_audio, audio) == pending_audio.end()) return generating_voice = false;
-            }
-            if (!audio_data.size()) {
-                VoiceLog("Failed to generate voice data");
-                delete audio;
-                return generating_voice = false;
-            }
-
-            // Save to cache
-            Resources::EnsureFolderExists(audio->path.parent_path());
-            FILE* fp = fopen(audio->path.string().c_str(), "wb");
-            if (!fp) {
-                VoiceLog("Failed to open file for writing: %s", audio->path.string().c_str());
-                delete audio;
-                return generating_voice = false;
-            }
-            const auto written = fwrite(audio_data.data(), sizeof(audio_data[0]), audio_data.size(), fp);
-            fclose(fp);
-            if (written < 1) {
-                VoiceLog("Failed to write audio data to file: %s", audio->path.string().c_str());
-                delete audio;
-                return generating_voice = false;
-            }
-            {
-                std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
-                if (std::ranges::find(pending_audio, audio) == pending_audio.end()) return generating_voice = false;
-            }
-            
-            audio->Play();
             return generating_voice = false;
             });
     }
@@ -1582,13 +1701,21 @@ return audio_data;
 void TextToSpeechModule::Update(float delta) {
     static float last_check = 0.f;
     last_check += delta;
-    if (last_check < 1.f) return;
+    if (last_check < 0.1f) return;
     last_check = 0.f;
     std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
-    for (auto& it : playing_audio_map) {
-        if (TIMER_DIFF(it.second->started) > std::max(it.second->duration, (clock_t)10000)) {
-            delete it.second;
-            break;
+    for (auto it = playing_audio_map.begin(); it != playing_audio_map.end(); ) {
+        PendingNPCAudio* audio = it->second;
+        if (!audio->IsPlaying()) {
+            if (!audio->playback_queue.empty()) {
+                audio->Play();
+                ++it;
+            } else {
+                delete audio;
+                it = playing_audio_map.begin(); // deletion invalidates iterators
+            }
+        } else {
+            ++it;
         }
     }
 }
@@ -1952,6 +2079,8 @@ void TextToSpeechModule::LoadSettings(ToolboxIni* ini)
     LOAD_BOOL(play_tts_in_explorable_areas);
     LOAD_BOOL(play_tts_in_outposts);
 
+    LOAD_INT(tts_timeout);
+
     LOAD_FLOAT(npc_speech_bubble_range);
 
     CSimpleIniA::TNamesDepend keys;
@@ -1998,6 +2127,7 @@ void TextToSpeechModule::SaveSettings(ToolboxIni* ini)
 
     SAVE_BOOL(stop_speech_when_dialog_closed);
     SAVE_BOOL(play_goodbye_messages);
+    SAVE_INT(tts_timeout);
     SAVE_BOOL(only_use_first_dialog);
     SAVE_BOOL(only_use_first_sentence);
     SAVE_BOOL(play_speech_from_non_friendly_npcs);
@@ -2107,6 +2237,9 @@ void TextToSpeechModule::DrawSettingsInternal()
 
     ImGui::Checkbox("Play greetings from merchants and traders", &play_speech_from_vendors);
     ImGui::ShowHelp("Note: For some types of traders, Only english language is currently supported.");
+
+    ImGui::SliderInt("TTS Request Timeout (s)", &tts_timeout, 1, 30);
+    ImGui::ShowHelp("The timeout in seconds for text-to-speech API requests.\nIncrease this if you experience frequent timeouts on slower connections or with long text.");
 
     ImGui::Checkbox("Stop speech when dialog window is closed", &stop_speech_when_dialog_closed);
 

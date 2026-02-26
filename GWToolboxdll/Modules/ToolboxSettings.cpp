@@ -72,6 +72,7 @@
 #include <Windows/SkillListingWindow.h>
 #endif
 #include <Windows/TargetInfoWindow.h>
+#include <Windows/MissionWikiWindow.h>
 #include <Windows/GWMarketWindow.h>
 #include <Windows/InventorySorting.h>
 
@@ -213,6 +214,7 @@ namespace {
         ArmoryWindow::Instance(),
         EnemyWindow::Instance(),
         TargetInfoWindow::Instance(),
+        MissionWikiWindow::Instance(),
         DropTrackerWindow::Instance(),
         GWMarketWindow::Instance(),
         InventorySorting::Instance()

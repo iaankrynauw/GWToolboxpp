@@ -1283,9 +1283,29 @@ namespace {
             default:                                          lang_code = "a"; break;
         }
         request_body["lang_code"] = lang_code;
+        request_body["stream"] = true; // Enable streaming for sentence-by-sentence generation
 
         RestClient client;
-        const auto audio_data = PostJson(client, base_url + "/v1/audio/speech", request_body, api_config->name);
+        client.SetUrl((base_url + "/v1/audio/speech").c_str());
+        client.SetHeader("Content-Type", "application/json");
+        client.SetPostContent(request_body.dump(), ContentFlag::Copy);
+        client.SetFollowLocation(true);
+        client.SetVerifyHost(false);
+        client.SetVerifyPeer(false);
+        client.SetTimeoutSec(30); // Longer timeout for streaming
+
+        client.Execute();
+
+        if (!client.IsSuccessful()) {
+            VoiceLog("%s returned error code: %ld", api_config->name, client.GetStatusCode());
+            std::string error_response = std::move(client.GetContent());
+            if (!error_response.empty()) {
+                VoiceLog("Error response: %s", error_response.c_str());
+            }
+            return "";
+        }
+
+        const auto audio_data = std::move(client.GetContent());
         if (!audio_data.empty()) {
             VoiceLog("Kokoro voice generation successful, received %zu bytes", audio_data.size());
         }

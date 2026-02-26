@@ -73,3 +73,6 @@ build/
 # VSCode stuff
 .vscode/
 .aider*
+
+# Development notes
+notes/

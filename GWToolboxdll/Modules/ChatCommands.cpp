@@ -48,6 +48,7 @@
 #include <Modules/ChatCommands.h>
 #include <Modules/GameSettings.h>
 #include <Modules/ChatSettings.h>
+#include <Windows/MissionWikiWindow.h>
 #include <Modules/InventoryManager.h>
 #include <Widgets/PartyDamage.h>
 #include <Windows/BuildsWindow.h>
@@ -1585,6 +1586,7 @@ void ChatCommands::Initialize()
         {L"xunlai", CmdChest},
         {L"useskill", CmdUseSkill},
         {L"scwiki", CmdSCWiki},
+        {L"missionwiki", CmdMissionWiki},
         {L"load", CmdLoad},
         {L"pingbuild", CmdPingBuild},
         {L"quest", CmdPingQuest},
@@ -2494,6 +2496,12 @@ void CHAT_CMD_FUNC(ChatCommands::CmdSCWiki)
         wcscat_s(link, argv[i]);
         ShellExecuteW(nullptr, L"open", link, nullptr, nullptr, SW_SHOWNORMAL);
     }
+}
+
+void CHAT_CMD_FUNC(ChatCommands::CmdMissionWiki)
+{
+    MissionWikiWindow::Instance().FetchCurrentMission();
+    MissionWikiWindow::Instance().visible = true;
 }
 
 void CHAT_CMD_FUNC(ChatCommands::CmdLoad)

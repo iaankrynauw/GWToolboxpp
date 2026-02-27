@@ -1161,7 +1161,7 @@ namespace {
     }
 
     // Shared function for making streaming JSON API requests
-    void StreamingPostJson(PendingNPCAudio* audio, const std::string& url, const nlohmann::json& request_body, const std::string& service_name = "API")
+    void StreamingPostJson(PendingNPCAudio* audio, const std::string& url, const nlohmann::json& request_body, [[maybe_unused]] const std::string& service_name = "API")
     {
         std::string current_chunk_data;
         size_t chunk_count = 0;

@@ -22,6 +22,8 @@ constexpr auto GWTOOLBOX_INI_FILENAME = L"GWToolbox.ini";
 #define SAVE_STRING(var) ini->SetValue(Name(), #var, (var).c_str());
 #define LOAD_BOOL(var) var = ini->GetBoolValue(Name(), #var, var);
 #define SAVE_BOOL(var) ini->SetBoolValue(Name(), #var, var);
+#define LOAD_INT(var) var = static_cast<int>(ini->GetLongValue(Name(), #var, static_cast<long>(var)));
+#define SAVE_INT(var) ini->SetLongValue(Name(), #var, static_cast<long>(var));
 #define LOAD_FLOAT(var) var = static_cast<float>(ini->GetDoubleValue(Name(), #var, static_cast<double>(var)));
 #define SAVE_FLOAT(var) ini->SetDoubleValue(Name(), #var, static_cast<double>(var));
 #define LOAD_UINT(var) var = static_cast<unsigned int>(ini->GetLongValue(Name(), #var, static_cast<long>(var)));

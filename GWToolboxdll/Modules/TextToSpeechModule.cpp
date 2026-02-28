@@ -56,6 +56,7 @@ namespace {
     bool play_speech_from_vendors = true;
     bool play_tts_in_explorable_areas = true;
     bool play_tts_in_outposts = true;
+    int tts_timeout = 2;
 
     struct PendingNPCAudio;
     typedef std::string (*GenerateVoiceCallback)(PendingNPCAudio* audio);
@@ -1122,7 +1123,7 @@ namespace {
         client.SetFollowLocation(true);
         client.SetVerifyHost(false);
         client.SetVerifyPeer(false);
-        client.SetTimeoutSec(2);
+        client.SetTimeoutSec(tts_timeout);
 
         client.Execute();
 
@@ -1951,6 +1952,7 @@ void TextToSpeechModule::LoadSettings(ToolboxIni* ini)
     LOAD_BOOL(play_speech_from_vendors);
     LOAD_BOOL(play_tts_in_explorable_areas);
     LOAD_BOOL(play_tts_in_outposts);
+    LOAD_INT(tts_timeout);
 
     LOAD_FLOAT(npc_speech_bubble_range);
 
@@ -2008,6 +2010,7 @@ void TextToSpeechModule::SaveSettings(ToolboxIni* ini)
 
     SAVE_BOOL(play_tts_in_explorable_areas);
     SAVE_BOOL(play_tts_in_outposts);
+    SAVE_INT(tts_timeout);
 
     SAVE_FLOAT(npc_speech_bubble_range);
 
@@ -2118,6 +2121,12 @@ void TextToSpeechModule::DrawSettingsInternal()
     ImGui::NextSpacedElement();
     ImGui::Checkbox("Outposts", &play_tts_in_outposts);
     ImGui::Unindent();
+
+    ImGui::TextUnformatted("TTS Request Timeout:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(100.0f);
+    ImGui::SliderInt("##tts_timeout", &tts_timeout, 1, 10, "%d seconds");
+    ImGui::ShowHelp("Maximum time to wait for TTS API response before giving up");
 
     ImGui::TextUnformatted("Play speech bubbles:");
     ImGui::Indent();

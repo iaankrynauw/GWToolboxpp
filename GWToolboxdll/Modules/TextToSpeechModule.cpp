@@ -1160,57 +1160,36 @@ namespace {
         return std::move(client.GetContent());
     }
 
-    // Shared function for making streaming JSON API requests
+    // Shared function for making streaming JSON API requests.
+    // Kokoro-FastAPI with stream=true sends one complete MP3 per sentence as separate HTTP chunks.
+    // We write each chunk to a temp file and queue it for playback immediately.
     void StreamingPostJson(PendingNPCAudio* audio, const std::string& url, const nlohmann::json& request_body, [[maybe_unused]] const std::string& service_name = "API")
     {
-        std::string current_chunk_data;
         size_t chunk_count = 0;
 
         auto on_chunk = [&](const char* bytes, size_t count) {
+            if (!count) return;
+
             // Check if audio object is still valid
             {
                 std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
                 if (std::ranges::find(pending_audio, audio) == pending_audio.end() &&
                     playing_audio_map.find(audio->agent_id) == playing_audio_map.end()) {
-                    return; // Audio was deleted, stop processing
+                    return;
                 }
             }
-            
-            current_chunk_data.append(bytes, count);
-            
-            // Look for MP3 frame sync / ID3 tag which Kokoro sends between sentences
-            // Kokoro-FastAPI yields a complete MP3 file per sentence.
-            // We search for the start of a new MP3 stream (ID3 or 0xFF 0xFB sync)
-            const unsigned char mp3_sync[] = { 0xFF, 0xFB };
-            const char id3_sync[] = "ID3";
-            
-            size_t search_offset = 10; // Skip the header of the current chunk we are building
-            while (current_chunk_data.size() > search_offset) {
-                size_t next_sync = current_chunk_data.find(id3_sync, search_offset);
-                if (next_sync == std::string::npos) {
-                    next_sync = current_chunk_data.find(reinterpret_cast<const char*>(mp3_sync), search_offset, sizeof(mp3_sync));
-                }
 
-                if (next_sync != std::string::npos) {
-                    // We found the start of the NEXT sentence. 
-                    // Extract the COMPLETED sentence before it.
-                    std::string finished_sentence = current_chunk_data.substr(0, next_sync);
-                    current_chunk_data = current_chunk_data.substr(next_sync);
+            // Each HTTP chunk from Kokoro is a complete MP3 for one sentence.
+            // Write directly to a temp file and queue for playback.
+            auto chunk_path = Resources::GetPath("NPCVoiceCache") / "streaming" /
+                              std::format("{}_{}_{}.mp3", audio->agent_id, TIMER_INIT(), chunk_count++);
+            Resources::EnsureFolderExists(chunk_path.parent_path());
 
-                    // Save this sentence to a temp file and play it
-                    auto chunk_path = Resources::GetPath("NPCVoiceCache") / "streaming" / std::format("{}_{}_{}.mp3", audio->agent_id, TIMER_INIT(), chunk_count++);
-                    Resources::EnsureFolderExists(chunk_path.parent_path());
-                    
-                    FILE* fp = fopen(chunk_path.string().c_str(), "wb");
-                    if (fp) {
-                        fwrite(finished_sentence.data(), 1, finished_sentence.size(), fp);
-                        fclose(fp);
-                        audio->Play(chunk_path);
-                    }
-                    search_offset = 10;
-                } else {
-                    break; 
-                }
+            FILE* fp = fopen(chunk_path.string().c_str(), "wb");
+            if (fp) {
+                fwrite(bytes, 1, count, fp);
+                fclose(fp);
+                audio->Play(chunk_path);
             }
         };
 
@@ -1222,29 +1201,7 @@ namespace {
         client.SetVerifyHost(false);
         client.SetVerifyPeer(false);
         client.SetTimeoutSec(tts_timeout);
-
         client.Execute();
-
-        // Don't forget the very last chunk
-        if (!current_chunk_data.empty() && client.IsSuccessful()) {
-            // Check if audio object is still valid before processing final chunk
-            {
-                std::lock_guard<std::recursive_mutex> lock(playing_audio_mutex);
-                if (std::ranges::find(pending_audio, audio) == pending_audio.end() &&
-                    playing_audio_map.find(audio->agent_id) == playing_audio_map.end()) {
-                    return; // Audio was deleted, stop processing
-                }
-            }
-            
-            auto chunk_path = Resources::GetPath("NPCVoiceCache") / "streaming" / std::format("{}_{}_{}.mp3", audio->agent_id, TIMER_INIT(), chunk_count++);
-            Resources::EnsureFolderExists(chunk_path.parent_path());
-            FILE* fp = fopen(chunk_path.string().c_str(), "wb");
-            if (fp) {
-                fwrite(current_chunk_data.data(), 1, current_chunk_data.size(), fp);
-                fclose(fp);
-                audio->Play(chunk_path);
-            }
-        }
     }
 
     // Add OpenAI TTS function
